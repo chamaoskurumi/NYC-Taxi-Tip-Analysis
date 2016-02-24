@@ -1,0 +1,184 @@
+---
+title: "NYC Taxi Tip Analysis"
+author: "Guido Schulz"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    number_sections: no
+    theme: spacelab
+---
+
+```{r setup, include=FALSE}
+# Load packages
+library("knitr")
+library("dplyr")
+library("ggplot2")
+library("gridExtra")
+library("mapview")
+library("magrittr")
+library("DT")
+library("leaflet")
+
+knitr::opts_chunk$set(echo = TRUE, include=FALSE)
+
+# Set working directory:
+MYDIR <- file.path("/home/dao/ownCloud/MeinFernbus_Hausaufgabe/DATA")
+setwd(MYDIR)
+# Load data
+load("NYtaxi.Rdata") # NYtaxi is the georeferenced data
+taxi <- NYtaxi@data  # taxi will be the NON georeferenced data
+```
+
+## Intro
+Looking for a job in Berlin ain't easy, so I decided to take my destiny in my own hands and took a crazy decision:
+*I want to become a taxi driver in NYC!*. I have never been to NYC and I reckon there is a good amount of smart people already trying to make living as a taxi driver, so I better come up with a proper plan how to put my decision into action.
+
+Since I have some fair knowledge of *R* and *statistics*, I decided to find out if **there some areas in NYC, traveling from which people pay more tips**. For a start, that should give me an idea of where I start looking for the "right" customers. 
+
+## Data
+As I have already booked my flight for the mid of May, I decided to analyse [yellow cab trip data from June 2015](https://storage.googleapis.com/tlc-trip-data/2015/yellow_tripdata_2015-06.csv) to draw some conclusions about the spatial distribution of tips.
+
+### Preparation
+The dataset is about 2GB and has more than 12 Million rows. A documentation of the dataset can be found [here](http://www.nyc.gov/html/tlc/downloads/pdf/data_dictionary_trip_records_yellow.pdf). I used [this](https://github.com/chamaoskurumi/NYC-Taxi-Tip-Analysis/blob/master/prepare_NYC_taxidata.R) *R* script to read, clean and process the data, making it ready for the analysis of tips. The script may be run on your local machine - you just need to adjust the working directory accordingly.
+
+### Limitations
+Despite providing 12 Million observations, the scope of my analysis has its limitations. According to the [documentation](http://www.nyc.gov/html/tlc/downloads/pdf/data_dictionary_trip_records_yellow.pdf), tips were *only* recorded for rides payed with credit card. This fact unfortunately forces us to exclude around 40% of the observations for the otherwise comprehensive data. Hence, we have our first big bias. After the exclusion of *non* credit card paid rides and some other data cleaning, the number of valid observations boils down to around 7.7 Million observations.
+
+Another bias we are going to face stems from the highly unequal spatial distribution of the trip origins. Mapping all trips onto  
+[NYC Census Tracts](http://www1.nyc.gov/assets/planning/download/zip/data-maps/open-data/nyct2000_15d.zip) (n=2216) around 80% of the areas gather less than 10 taxi rides. Therefore, NYC Census Tracts seem to be _way_ too fine grained to carry out the analysis (unless I include a good bunch of other taxi trip data records for other months). So I decided to take use the much bigger [NYC Community Districts (CD)](https://www1.nyc.gov/assets/planning/download/zip/data-maps/open-data/nycd_15d.zip) (n=71) as the target areas, on which taxi ride data will be aggregated.
+
+```{r calcs_and_drops}
+#ggplot(data=NYtaxi@data, aes(count)) + geom_histogram(fill="blue", colour="black", binwidth = 50000)
+N <- 5
+topNcountshare <- round((taxi %>% 
+                           arrange(-count)  %>% 
+                           slice(1:N)  %>% 
+                           select(count)  %>% 
+                           summarise(sum = sum(count))) / 
+                          sum(taxi$count)*100,0)
+mincount <- 100 # setting the acceptable minimum no of taxi rides per area
+noareasexcluded <- dim(NYtaxi[NYtaxi$count < mincount, ])[1] # number of areas excluded
+NYtaxi <- NYtaxi[NYtaxi$count > mincount, ] # We exclude all areas with less than mincount rides
+taxi   <- NYtaxi@data # taxi will be the NON georeferenced data
+```
+However, the concentration of trip ride origins remains. The `r N` CDs with the highest number of taxi rides alone make for `r topNcountshare`% of _all_ (valid) citywide taxi rides. To tackle this porblem, we drop all areas for which less than `r mincount` taxi rides were recorded, resulting in the exclusion of `r noareasexcluded` areas of the original 71 areas. Thus, my analysis will be based on the remaining n=`r dim(NYtaxi)[1]` areas.
+
+## Different tip measures
+Before I start with my analysis, I need things to be clear in my head: *What is it exactly, that I am looking for?* 
+
+A high tip in itself is not going to make me happy. Tips are usually paid proportionally to the total price, which in turn depends on the trip duration and distance. If a (nominally) higher tip requires proportionally longer working hours / more spendings, there is not much to gain from my analysis. Hence, I better consider different measures for tips. The measures to be used in the analysis of tips on aggregate CD level are:
+
+1. median tip in $
+2. median ratio of tip to total price in %
+3. median ratio of tip to trip distance in $/mile
+4. median ratio of tip to trip duration in $/minute.
+
+Surprisingly, the different measures do not correlate very much:
+
+```{r correlations_between_measures, include=TRUE, echo=FALSE, asis=TRUE}
+taxi4cor <- taxi %>% select(tip_med, ratio_tip_total_med:ratio_tip_duration_med) 
+colnames(taxi4cor) <- c("tip","tip/total","tip/distance","tip/duration")
+kable(cor(taxi4cor), digits=2)
+```
+
+Thus, it actually makes sense to analyse them all individually.
+
+## Distributions of tip measures
+Let's first take a look at the *non spatial* distribution of the tip measures in the form of boxplots and let's see if there are some areas, where "extremly" high tips are paid. Outliers, defined as having absolute values greater than 1.5 times the inter quartile range, are presented in red.
+
+```{r, include=TRUE, echo=FALSE, fig.height=8}
+taxi$tip_med_name                <- "1. Median tip in $"
+taxi$ratio_tip_total_med_name    <- "2. Median ratio of tip/total in %"
+taxi$ratio_tip_distance_med_name <- "3. Median ratio of tip/distance in $/mile"
+taxi$ratio_tip_duration_med_name <- "4. Median ratio of tip/duration in $/min"
+mytheme <- theme(axis.title.y = element_blank(),
+                 axis.title.x = element_blank(),
+                 axis.text.x  = element_text(size=10))
+
+gg1 <- ggplot(data=taxi, aes(x=tip_med_name, y=tip_med)) + 
+  geom_boxplot(outlier.colour="red") + mytheme
+
+gg2 <- ggplot(data=taxi, aes(x=ratio_tip_total_med_name, y=ratio_tip_total_med)) + 
+  geom_boxplot(outlier.colour="red") + mytheme
+
+gg3 <- ggplot(data=taxi, aes(x=taxi$ratio_tip_distance_med_name, y=taxi$ratio_tip_distance_med)) + 
+  geom_boxplot(outlier.colour="red") + mytheme
+
+gg4 <- ggplot(data=taxi, aes(x=ratio_tip_duration_med_name , y=ratio_tip_duration_med)) + 
+  geom_boxplot(outlier.colour="red") + mytheme
+
+grid.arrange(gg1, gg2, gg3, gg4, ncol=2)
+```
+
+Measure 1 suggests I should look for customers in the Bronx CDs `r taxi[order(-taxi$tip_med),]$id[1]`,  `r taxi[order(-taxi$tip_med),]$id[2]` and `r taxi[order(-taxi$tip_med),]$id[3]`. CD `r taxi[order(-taxi$tip_med),]$id[1]` exibits a median tip amount of `r taxi[order(-taxi$tip_med),]$tip_med[1]`$, which is `r round(taxi[order(-taxi$tip_med),]$tip_med[1]/median(taxi$tip_med), 0)` times higher than average tip paid. As mentioned before, measure 1 is not very reliable as it does not consider either working time nor spendings. Hence we move on to the other measures.
+
+The distribution of measure 2 comes as a shock. Standardizing the tips by the total price, it seems as if there are *no areas at all*, where higher tips are paid! In almost *all* areas the median ration of tip to total amounts to `r median(taxi$ratio_tip_total_med)`%.
+
+Measure 3 tells me the Manhatten CD `r taxi[order(-taxi$ratio_tip_distance_med),]$id[1]` isthe place to be and measure 4 in turn brings be back to the Bronx, namely the CDs `r taxi[order(-taxi$ratio_tip_duration_med),]$id[1]`, `r taxi[order(-taxi$ratio_tip_duration_med),]$id[2]` and `r taxi[order(-taxi$ratio_tip_duration_med),]$id[3]`.
+
+## Spatial distributions of tip measures
+Now let's look a the spatial distributions of all 4 measures - to get an actual idea of the areas and values.
+
+```{r setup_mapoptions}
+mapviewOptions(basemaps =c("CartoDB.Positron","CartoDB.DarkMatter","OpenStreetMap.DE","Stamen.Toner"))
+mymapview <- function(myzcol){
+  mapView(NYtaxi, 
+          zcol=myzcol, layer.name=mylayer.name,
+          lwd=1, 
+          alpha.regions=0.7)@map
+  }
+```
+
+### Map of median tip in $
+```{r map_tip_med, include=TRUE, echo=FALSE}
+mymapview("tip_med") 
+```
+
+The Bronx CDs exhibiting high tip medians are the ones close to JFK airport!
+
+### Map of tip/total ratio median in %
+```{r map_ratio_tip_total_med, include=TRUE, echo=FALSE}
+mymapview("ratio_tip_total_med") 
+```
+
+Pure disappointment. There seems to be a citywide fixed rate, that is `r median(taxi$ratio_tip_total_med)`% of the total. The diverging values for some areas *not* having `r median(taxi$ratio_tip_total_med)`% as their median tip/total ratio may be the result of low counts or measurement errors.
+
+### Map of tip/distance ratio in $/mile
+```{r map_ratio_tip_distance_med, include=TRUE, echo=FALSE}
+mymapview("ratio_tip_distance_med") 
+```
+
+Lower Manhatten is the place to be.
+
+### Map of tip/duration ratio in $/minute
+```{r map_ratio_tip_duration_med, include=TRUE, echo=FALSE}
+mymapview("ratio_tip_duration_med") 
+```
+
+According to the tip/duration measure, the upper Bronx looks like a decent place to look for customers.
+
+## Final Results & Conclusion
+To sum up my findings, I produced a sortable table for all 4 measures. It tells me with one click which CDs are the top tip paying areas.
+
+### Top tip areas
+```{r table_tip_analysis, include=TRUE, echo=FALSE}
+taxi %>% select(id:tip_med, ratio_tip_total_med:ratio_tip_duration_med) %>% 
+  mutate(ratio_tip_total_med = ratio_tip_total_med/100) %>% 
+  arrange(-tip_med) %>% 
+  datatable(class="cell-border stripe", 
+            caption="Table of different tip measures by NYC community districts",
+            colnames= c("CD id", "Borough", "# of rides", "tip", 
+                        "tip/total", "tip/distance", "tip/duration"),
+            options=list(pageLength = 10)) %>% 
+  formatCurrency(c('tip_med'), '$ ') %>%
+  formatCurrency(c('ratio_tip_distance_med'), '$/mile ') %>%
+  formatCurrency(c('ratio_tip_duration_med'), '$/min ') %>%
+  formatPercentage('ratio_tip_total_med', 0)
+```
+
+### Conclusion
+The ratio of tip to total price seems to be the yardstick to measure tips. This is because taximeters consider duration *and* distance, that is working hours *and* spendings to calculate the total price. Hence, the fact that there do not seem to be any areas where higher tip/total ratios are paid comes as a blow for me. Maybe I should reconsider my decision to move to NYC and rather stay in Berlin (-;
+
+### Futher ideas
+Maybe I should go deeper into the date and include a weekday and daytime analysis. I could also include more data from other months and certainly for cash paid rides to get more reliable results. Furthermore, I could do a more fine grained spatial analysis for specific neighbourhoods to figure out the exact blocks/streets where I should be looking for customers. However, the first thing to do would be to find out if my suspicion that there is a *fixed rate of 17%* on tips is true.  
